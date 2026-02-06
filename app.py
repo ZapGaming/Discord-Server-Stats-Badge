@@ -23,12 +23,11 @@ def get_headers(use_token=False):
     return headers
 
 def safe_txt(text):
-    """Escapes characters like <, >, & to prevent XML errors."""
-    return html.escape(str(text)) if text else ""
+    """Escapes characters like <, >, &, " to prevent XML errors."""
+    if not text: return ""
+    return html.escape(str(text))
 
 def fetch_and_process_image(url, blur=0, dim_opacity=0.0, target_width=800):
-    """Downloads, resizes, blurs, and returns B64."""
-    # Simple In-Memory Cache to prevent repeated processing
     cache_key = f"img_{url}_{blur}_{dim_opacity}_{target_width}"
     if cache_key in CACHE: return CACHE[cache_key]
 
@@ -37,19 +36,15 @@ def fetch_and_process_image(url, blur=0, dim_opacity=0.0, target_width=800):
         if r.status_code == 200:
             img = Image.open(BytesIO(r.content)).convert('RGB')
             
-            # 1. Calc Aspect Ratio
             w, h = img.size
             ratio = h / w
             new_h = int(target_width * ratio)
             
-            # 2. Resize
             img = img.resize((target_width, new_h), Image.Resampling.LANCZOS)
             
-            # 3. Blur
             if blur > 0:
                 img = img.filter(ImageFilter.GaussianBlur(blur))
             
-            # 4. Dim (Dark Overlay baked in)
             if dim_opacity > 0:
                 enhancer = ImageEnhance.Brightness(img)
                 img = enhancer.enhance(1.0 - dim_opacity)
@@ -64,10 +59,9 @@ def fetch_and_process_image(url, blur=0, dim_opacity=0.0, target_width=800):
     except:
         pass
     
-    # Return placeholder if failed
     return {"b64": "", "w": target_width, "h": 400}
 
-# --- DATA FETCHERS ---
+# --- FETCH DATA ---
 
 def fetch_lanyard(user_id):
     try:
@@ -86,103 +80,97 @@ def fetch_discord_user(user_id):
 
 @app.route('/stats')
 def render_stats():
-    # Params
     invite_code = request.args.get('invite')
     bg_url = request.args.get('bg', 'https://i.imgur.com/2aL8jE3.jpeg') 
-    staff_param = request.args.get('staff', '') # Format: ID:Role,ID:Role
+    staff_param = request.args.get('staff', '') 
 
     if not invite_code:
         return Response("Error: Missing ?invite=CODE", status=400)
 
-    # 1. Process Background (Get Dimensions)
-    # Using target_width 800 for high quality on retina
+    # 1. Background
     bg_data = fetch_and_process_image(bg_url, blur=0, dim_opacity=0.3, target_width=800)
     W, H = bg_data['w'], bg_data['h']
     
-    # 2. Fetch Server Info (With Token)
+    # 2. Server Data
     s_data = {"name": "Server Error", "mem": "0", "onl": "0", "icon": ""}
     
     try:
+        # Tries to get data; if RateLimited (429), it returns "Rate Limited" text
         r = requests.get(f"https://discord.com/api/v10/invites/{invite_code}?with_counts=true", headers=get_headers(use_token=True), timeout=5)
-        d = r.json()
         
         if r.status_code == 200:
-            g = d.get('guild')
-            s_data['name'] = safe_txt(g.get('name'))
+            d = r.json()
+            g = d.get('guild', {})
+            s_data['name'] = safe_txt(g.get('name', 'Server'))
             s_data['mem'] = f"{d.get('approximate_member_count', 0):,}"
             s_data['onl'] = f"{d.get('approximate_presence_count', 0):,}"
+            
             if g.get('icon'):
                 icon_url = f"https://cdn.discordapp.com/icons/{g['id']}/{g['icon']}.png?size=128"
-                # Resize icon small for performance
                 s_data['icon'] = fetch_and_process_image(icon_url, target_width=80)['b64']
-        elif r.status_code == 429:
-             s_data['name'] = "Rate Limited"
         else:
-             s_data['name'] = "Invalid Invite"
+            s_data['name'] = f"Invalid ({r.status_code})"
 
-    except Exception as e:
-        print(e)
+    except:
+        s_data['name'] = "API Error"
 
-    # 3. Process Staff / Roles
+    # 3. Staff Logic
     staff_cards = []
     if staff_param:
         for item in staff_param.split(','):
-            # Safe parse "id:role" or just "id"
+            if not item.strip(): continue
             parts = item.strip().split(':')
             uid = parts[0]
             role = parts[1] if len(parts) > 1 else "Staff"
             
-            # Defaults
-            user = {"name": "Unknown", "role": safe_txt(role), "color": "#747f8d", "avatar": ""}
+            u_obj = {"name": "Unknown", "role": safe_txt(role), "color": "#747f8d", "avatar": ""}
             
-            # Try Lanyard first
             lany = fetch_lanyard(uid)
             if lany:
-                duser = lany['discord_user']
-                user['name'] = safe_txt(duser['username'])
-                
-                status_map = {'online':'#3ba55c','idle':'#faa61a','dnd':'#ed4245','offline':'#747f8d'}
-                user['color'] = status_map.get(lany['discord_status'], '#747f8d')
-                
-                if duser['avatar']:
-                     url = f"https://cdn.discordapp.com/avatars/{duser['id']}/{duser['avatar']}.png?size=64"
-                     user['avatar'] = fetch_and_process_image(url, target_width=64)['b64']
+                duser = lany.get('discord_user')
+                if duser:
+                    u_obj['name'] = safe_txt(duser['username'])
+                    # Check Lanyard Avatar
+                    if duser['avatar']:
+                        url = f"https://cdn.discordapp.com/avatars/{duser['id']}/{duser['avatar']}.png?size=64"
+                        u_obj['avatar'] = fetch_and_process_image(url, target_width=64)['b64']
+                    
+                    status_map = {'online':'#3ba55c','idle':'#faa61a','dnd':'#ed4245','offline':'#747f8d'}
+                    u_obj['color'] = status_map.get(lany.get('discord_status'), '#747f8d')
             else:
-                # Fallback to Discord API
                 duser = fetch_discord_user(uid)
                 if duser:
-                    user['name'] = safe_txt(duser['username'])
+                    u_obj['name'] = safe_txt(duser['username'])
                     if duser.get('avatar'):
-                        url = f"https://cdn.discordapp.com/avatars/{duser['id']}/{duser['avatar']}.png?size=64"
-                        user['avatar'] = fetch_and_process_image(url, target_width=64)['b64']
+                         url = f"https://cdn.discordapp.com/avatars/{duser['id']}/{duser['avatar']}.png?size=64"
+                         u_obj['avatar'] = fetch_and_process_image(url, target_width=64)['b64']
 
-            staff_cards.append(user)
+            staff_cards.append(u_obj)
 
     # 4. Construct SVG
-    font = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif'
+    # ERROR FIX: Switched from "Segoe UI" to 'Segoe UI' (Single quotes) to not break HTML attribute
+    font = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
     
-    svg = f"""<svg width="{W}" height="{H}" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg">
+    # Header logic
+    svg = f"""<svg width="{W}" height="{H}" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
     <defs>
         <clipPath id="rnd"><rect width="80" height="80" rx="18"/></clipPath>
         <clipPath id="circ"><circle cx="24" cy="24" r="24"/></clipPath>
     </defs>
 
-    <!-- Background -->
+    <!-- BG -->
     <image href="{bg_data['b64']}" width="{W}" height="{H}" preserveAspectRatio="xMidYMid slice" />
     <rect width="{W}" height="{H}" fill="black" fill-opacity="0.2"/>
 
-    <!-- SECTION 1: SERVER INFO (Top Left) -->
+    <!-- SECTION 1: SERVER INFO -->
     <g transform="translate(40, 40)">
-        <!-- Blur Backdrop -->
         <rect x="-15" y="-15" width="420" height="110" rx="20" fill="black" fill-opacity="0.6"/>
         <rect x="-15" y="-15" width="420" height="110" rx="20" fill="none" stroke="white" stroke-opacity="0.1"/>
 
-        <!-- Icon -->
         <g clip-path="url(#rnd)">
             <image href="{s_data['icon']}" width="80" height="80"/>
         </g>
         
-        <!-- Text Details -->
         <text x="100" y="32" fill="white" font-family="{font}" font-weight="800" font-size="24">{s_data['name']}</text>
         
         <g transform="translate(100, 60)">
@@ -194,19 +182,19 @@ def render_stats():
         </g>
     </g>
 
-    <!-- SECTION 2: STAFF LIST (Bottom Left) -->
+    <!-- SECTION 2: STAFF LIST -->
     <g transform="translate(40, {H - 90})">
-        <!-- Optional Label -->
-        <text x="5" y="-15" fill="white" font-family="{font}" font-weight="700" font-size="10" opacity="0.7" letter-spacing="1">TEAM STATUS</text>
     """
-    
-    # Render Staff Cards
-    offset_x = 0
+
+    if staff_cards:
+        svg += f"""<text x="5" y="-15" fill="white" font-family="{font}" font-weight="700" font-size="10" opacity="0.7" letter-spacing="1">TEAM STATUS</text>"""
+
+    x_offset = 0
     for s in staff_cards:
         if not s['avatar']: continue
         
         svg += f"""
-        <g transform="translate({offset_x}, 0)">
+        <g transform="translate({x_offset}, 0)">
             <rect width="200" height="54" rx="27" fill="black" fill-opacity="0.7"/>
             <rect width="200" height="54" rx="27" fill="none" stroke="white" stroke-opacity="0.1"/>
             
@@ -221,16 +209,13 @@ def render_stats():
             <text x="60" y="39" fill="{s['color']}" font-family="{font}" font-weight="700" font-size="10" text-transform="uppercase" letter-spacing="0.5">{s['role']}</text>
         </g>
         """
-        offset_x += 210
+        x_offset += 210
 
-    svg += """
-    </g>
-    </svg>
-    """
+    svg += """</g></svg>"""
     
     resp = make_response(svg)
     resp.headers['Content-Type'] = 'image/svg+xml'
-    resp.headers['Cache-Control'] = 'max-age=120'
+    resp.headers['Cache-Control'] = 'no-cache, max-age=120'
     return resp
 
 if __name__ == '__main__':
