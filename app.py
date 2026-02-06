@@ -6,303 +6,273 @@ import time
 from io import BytesIO
 from flask import Flask, Response, request, make_response
 from PIL import Image, ImageFilter, ImageEnhance
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 
-# --- 1. CONFIGURATION ---
+# --- CONFIG ---
 BOT_TOKEN = os.environ.get("DISCORD_TOKEN")
-CACHE_DURATION = 120  # Seconds to cache data (Keep Discord happy)
 
-# Internal RAM Cache
-CACHE = {} 
-IMG_CACHE = {}
+# Internal Caches
+# Structure: { key: { "data": ..., "expires": timestamp } }
+CACHE_SERVER = {}
+CACHE_USER = {}
+CACHE_IMG = {}
 
-# --- 2. THE BOT NETWORK ENGINE ---
+DEFAULT_BG = "https://i.imgur.com/2aL8jE3.jpeg"
 
-# Setup a robust session with Retries to handle 429s automatically
-session = requests.Session()
+# --- HELPERS ---
 
-# Add logic to automatically wait and retry if Discord is busy
-retry_strategy = Retry(
-    total=3,
-    backoff_factor=1,  # Wait 1s, then 2s, then 4s
-    status_forcelist=[429, 500, 502, 503, 504],
-)
-adapter = HTTPAdapter(max_retries=retry_strategy)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
-
-def get_discord_headers():
-    """Forces all requests to appear as the Bot, not the shared server IP."""
-    headers = {
-        "User-Agent": "DiscordBot (https://github.com/your-repo, 1.0)",
-        "Content-Type": "application/json"
+def get_headers():
+    h = {
+        "User-Agent": "DiscordBot (https://github.com/generic/app, 1.0)", 
+        "Accept": "application/json"
     }
-    # This is the Key: Routes traffic via Bot Identity
     if BOT_TOKEN:
-        headers["Authorization"] = f"Bot {BOT_TOKEN}"
-    return headers
+        h["Authorization"] = f"Bot {BOT_TOKEN}"
+    return h
 
-def safe(text):
-    """Prevents XML breakage."""
-    return html.escape(str(text)) if text else ""
+def safe_str(txt):
+    return html.escape(str(txt)) if txt else ""
 
-# --- 3. ADVANCED IMAGE PROCESSING ---
-
-def fetch_image_asset(url, width=100, height=None, blur=0, dim=0.0):
+def get_smart_timeout_image(url, width=100, blur=0, dim=0.0):
     """
-    Downloads, resizes, optimizes, blurs, and caches images.
+    Safely fetches image. 
+    Crucial fix: Returns Default BG if the URL is slow/blocked (like betterdiscord).
     """
-    # 1. Check Cache
     key = f"{url}-{width}-{blur}-{dim}"
-    if key in IMG_CACHE: return IMG_CACHE[key]
+    if key in CACHE_IMG:
+        return CACHE_IMG[key]
 
     try:
-        # Use our session with headers (avoids blocking on image domains)
-        r = session.get(url, timeout=5)
+        # STRICT TIMEOUT: 3 seconds. If bg takes longer, we skip it.
+        # Verify=False helps with some bad SSL certs on random image hosts
+        r = requests.get(url, timeout=3, headers={"User-Agent":"Mozilla/5.0"}) 
         
         if r.status_code == 200:
             img = Image.open(BytesIO(r.content)).convert('RGB')
-
-            # Smart Resize
-            if not height:
-                ratio = img.height / img.width
-                height = int(width * ratio)
             
-            img = img.resize((width, height), Image.Resampling.LANCZOS)
-
-            # Apply Effects
+            # Resize
+            ratio = img.height / img.width
+            new_h = int(width * ratio)
+            img = img.resize((width, new_h), Image.Resampling.LANCZOS)
+            
+            # Process
             if blur > 0: img = img.filter(ImageFilter.GaussianBlur(blur))
             if dim > 0:
                 e = ImageEnhance.Brightness(img)
                 img = e.enhance(1.0 - dim)
 
-            # Export
             buff = BytesIO()
-            img.save(buff, format="JPEG", quality=90)
+            img.save(buff, format="JPEG", quality=85)
             b64 = f"data:image/jpeg;base64,{base64.b64encode(buff.getvalue()).decode('utf-8')}"
             
-            # Save to Cache
-            IMG_CACHE[key] = {"data": b64, "w": width, "h": height}
-            return IMG_CACHE[key]
+            res = {"data": b64, "w": width, "h": new_h}
+            CACHE_IMG[key] = res
+            return res
+            
     except Exception as e:
-        print(f"Img Error: {e}")
+        print(f"Skipping BG {url}: {e}")
+        pass # Fallback below
 
-    # Fallback Placeholder
-    return {"data": "", "w": width, "h": height or 100}
-
-# --- 4. DATA LOGIC ---
-
-def fetch_user_data(uid, override_role=None, override_color=None):
-    """Combines Lanyard (Real Status) + Discord API (Profile)"""
+    # Check if we were trying to fetch default, if so avoid infinite loop
+    if url == DEFAULT_BG: return {"data": "", "w": width, "h": 100}
     
-    # Defaults
-    user = {
-        "name": "User", 
-        "role": override_role or "Member", 
-        "color": override_color or "#747f8d", 
-        "avatar": "",
-        "found": False
-    }
+    # Fallback to internal logic
+    return get_smart_timeout_image(DEFAULT_BG, width, blur, dim)
 
-    # A. Try Lanyard (For Status Color)
+# --- API LOGIC (NO RETRY SLEEPING) ---
+
+def get_cached_or_fetch(url, cache_dict, expiry=120, key=None):
+    now = time.time()
+    k = key or url
+    
+    # 1. Return Cache if fresh
+    if k in cache_dict:
+        item = cache_dict[k]
+        if now < item['expires']:
+            return item['payload']
+
+    # 2. Try Fetch
     try:
-        r = session.get(f"https://api.lanyard.rest/v1/users/{uid}", timeout=2)
+        r = requests.get(url, headers=get_headers(), timeout=4) # MAX 4 sec
+        
         if r.status_code == 200:
             data = r.json()
-            if data['success']:
-                lanyard = data['data']
-                discord = lanyard['discord_user']
-                
-                user['found'] = True
-                user['name'] = discord['username']
-                
-                # Dynamic Status Color (unless overridden)
-                if not override_color:
-                    status = lanyard['discord_status']
-                    colors = {'online': '#3ba55c', 'idle': '#faa61a', 'dnd': '#ed4245', 'offline': '#747f8d'}
-                    user['color'] = colors.get(status, '#747f8d')
+            # Cache it
+            cache_dict[k] = {"payload": data, "expires": now + expiry}
+            return data
+            
+        elif r.status_code == 429:
+            # 3. IF RATE LIMITED, RETURN OLD DATA IF EXISTS
+            if k in cache_dict:
+                print(f"Rate limit hit for {k}, using stale cache.")
+                return cache_dict[k]['payload']
+            print(f"Rate limited hard on {k}, no cache.")
+            return None
+    except:
+        # If timeout, return stale cache if exists
+        if k in cache_dict: return cache_dict[k]['payload']
+        return None
 
-                # Avatar
-                if discord['avatar']:
-                     ext = "gif" if discord['avatar'].startswith("a_") else "png"
-                     user['avatar'] = f"https://cdn.discordapp.com/avatars/{uid}/{discord['avatar']}.{ext}?size=64"
-    except: pass
+    return None
 
-    # B. Fallback to Bot API (If Lanyard fails)
-    if not user['found'] and BOT_TOKEN:
-        try:
-            r = session.get(f"https://discord.com/api/v10/users/{uid}", headers=get_headers(), timeout=3)
-            if r.status_code == 200:
-                d = r.json()
-                user['name'] = d['username']
-                if d.get('avatar'):
-                    user['avatar'] = f"https://cdn.discordapp.com/avatars/{uid}/{d['avatar']}.png?size=64"
-        except: pass
+def process_staff_list(staff_str):
+    """Parses id:role:color string."""
+    cards = []
+    if not staff_str: return cards
+    
+    for entry in staff_str.split(','):
+        if not entry.strip(): continue
+        
+        parts = entry.strip().split(':')
+        uid = parts[0]
+        role = parts[1] if len(parts) > 1 else "Member"
+        color = parts[2] if len(parts) > 2 else None
+        
+        user_obj = {
+            "name": "User", "role": safe_str(role), 
+            "color": color or "#747f8d", "avatar": ""
+        }
+        
+        # 1. Try Lanyard
+        lan_url = f"https://api.lanyard.rest/v1/users/{uid}"
+        l_data = get_cached_or_fetch(lan_url, CACHE_USER, expiry=300) # 5 min cache for users
+        
+        fetched_discord_data = False
+        
+        if l_data and l_data.get('success'):
+             data = l_data['data']
+             du = data['discord_user']
+             user_obj['name'] = safe_str(du['username'])
+             fetched_discord_data = True
+             
+             if not color:
+                 st = data.get('discord_status','offline')
+                 cmap = {'online':'#3ba55c','idle':'#faa61a','dnd':'#ed4245','offline':'#747f8d'}
+                 user_obj['color'] = cmap.get(st, '#747f8d')
+             
+             if du.get('avatar'):
+                  ext = "gif" if du['avatar'].startswith("a_") else "png"
+                  user_obj['avatar'] = f"https://cdn.discordapp.com/avatars/{uid}/{du['avatar']}.{ext}?size=64"
 
-    return user
+        # 2. If Lanyard failed, try Direct Discord
+        if not fetched_discord_data:
+             d_url = f"https://discord.com/api/v10/users/{uid}"
+             d_data = get_cached_or_fetch(d_url, CACHE_USER, expiry=3600)
+             if d_data:
+                 user_obj['name'] = safe_str(d_data.get('username','User'))
+                 if d_data.get('avatar'):
+                     user_obj['avatar'] = f"https://cdn.discordapp.com/avatars/{uid}/{d_data['avatar']}.png?size=64"
 
-# --- 5. MAIN ROUTE ---
+        # Prepare Avatar for SVG (Download to Base64)
+        if user_obj['avatar']:
+            user_obj['avatar'] = get_smart_timeout_image(user_obj['avatar'], width=50)['data']
+
+        cards.append(user_obj)
+        
+    return cards
+
+# --- ROUTE ---
 
 @app.route('/stats')
-def render_stats():
-    # INPUTS
-    invite_code = request.args.get('invite')
-    bg_url = request.args.get('bg') or "https://i.imgur.com/2aL8jE3.jpeg" # Default Chillax
-    staff_string = request.args.get('staff', '') 
+def render():
+    invite = request.args.get('invite')
+    bg_raw = request.args.get('bg')
+    staff = request.args.get('staff')
     
-    if not invite_code:
-        return Response("Error: Missing ?invite=CODE", status=400)
+    # Force default if using that specific bad URL or none
+    if not bg_raw or "betterdiscord" in bg_raw:
+        bg_url = DEFAULT_BG
+    else:
+        bg_url = bg_raw
 
-    # 1. PROCESS BG
-    bg_asset = fetch_image_asset(bg_url, width=900, blur=0, dim=0.4)
-    W, H = bg_asset['w'], bg_asset['h']
+    if not invite:
+        return Response("Error: ?invite=CODE needed", status=400)
 
-    # 2. FETCH SERVER
-    s = {"name": "Server Loading", "onl": "0", "mem": "0", "icon": ""}
+    # 1. BG Image
+    bg = get_smart_timeout_image(bg_url, width=800, blur=0, dim=0.3)
+    W, H = bg['w'], bg['h']
+
+    # 2. Server Stats
+    s = {"name": "Loading...", "onl": "0", "mem": "0", "icon": ""}
     
-    try:
-        # We explicitly use the BOT session here to route traffic
-        url = f"https://discord.com/api/v10/invites/{invite_code}?with_counts=true"
-        r = session.get(url, headers=get_discord_headers(), timeout=5)
-        
-        if r.status_code == 200:
-            d = r.json()
-            g = d.get('guild')
-            
-            s['name'] = safe(g.get('name'))
-            s['mem'] = f"{d.get('approximate_member_count', 0):,}"
-            s['onl'] = f"{d.get('approximate_presence_count', 0):,}"
-            
-            if g.get('icon'):
-                icon_url = f"https://cdn.discordapp.com/icons/{g['id']}/{g['icon']}.png?size=128"
-                # Process Icon
-                s['icon'] = fetch_image_asset(icon_url, width=100)['data']
-                
-        elif r.status_code == 429:
-            s['name'] = "Rate Limited (Wait)"
-            print("Server is 429ing even with Bot Token.")
-        else:
-            s['name'] = f"Invalid Invite ({r.status_code})"
-
-    except Exception as e:
-        print(f"Server Error: {e}")
-        s['name'] = "Connection Error"
-
-    # 3. PROCESS STAFF ROLES
-    # Format: id:Role:Color, id:Role
-    staff_cards = []
-    if staff_string:
-        entries = staff_string.split(',')
-        for entry in entries:
-            parts = entry.strip().split(':')
-            uid = parts[0]
-            role = parts[1] if len(parts) > 1 else "Staff"
-            color = parts[2] if len(parts) > 2 else None # Optional custom color override
-            
-            # Fetch
-            u_data = fetch_user_data(uid, override_role=role, override_color=color)
-            
-            # Optimize Avatar for SVG
-            if u_data['avatar']:
-                u_data['avatar'] = fetch_image_asset(u_data['avatar'], width=64)['data']
-            
-            staff_cards.append(u_data)
-
-    # 4. DRAW SVG (Complex Glass UI)
-    font = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+    api_url = f"https://discord.com/api/v10/invites/{invite}?with_counts=true"
+    s_data = get_cached_or_fetch(api_url, CACHE_SERVER, expiry=60, key=invite) # 1 min cache for counts
     
-    # Calculate Dynamic Height (Base + Staff Rows)
-    # But for a banner we usually keep fixed or aspect. Let's trust the BG.
+    if s_data:
+        guild = s_data.get('guild', {})
+        s['name'] = safe_str(guild.get('name'))
+        s['mem'] = f"{s_data.get('approximate_member_count', 0):,}"
+        s['onl'] = f"{s_data.get('approximate_presence_count', 0):,}"
+        if guild.get('icon'):
+            u = f"https://cdn.discordapp.com/icons/{guild['id']}/{guild['icon']}.png?size=128"
+            s['icon'] = get_smart_timeout_image(u, width=80)['data']
+    else:
+        # Fallback if Rate Limited / API down
+        s['name'] = "Server Info (Limited)"
+
+    # 3. Staff
+    staff_cards = process_staff_list(staff)
+
+    # 4. SVG Construction
+    font = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, sans-serif"
     
-    svg = f"""
-    <svg width="{W}" height="{H}" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+    svg = f"""<svg width="{W}" height="{H}" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg">
     <defs>
-        <clipPath id="c_icon"><rect width="80" height="80" rx="16"/></clipPath>
-        <clipPath id="c_ava"><circle cx="20" cy="20" r="20"/></clipPath>
-        <linearGradient id="grad_pill" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stop-color="#fff" stop-opacity="0.15"/>
-            <stop offset="100%" stop-color="#fff" stop-opacity="0.05"/>
-        </linearGradient>
+        <clipPath id="rn"><rect width="80" height="80" rx="16"/></clipPath>
+        <clipPath id="ci"><circle cx="20" cy="20" r="20"/></clipPath>
     </defs>
-
-    <!-- Background -->
-    <image href="{bg_asset['data']}" width="{W}" height="{H}" />
     
-    <!-- MAIN SERVER CARD (Floating Top Left) -->
-    <g transform="translate(40, 40)">
-        <!-- Frosted Glass Backing -->
-        <rect width="450" height="120" rx="20" fill="#000" fill-opacity="0.65"/>
-        <rect width="450" height="120" rx="20" fill="url(#grad_pill)" stroke="#fff" stroke-opacity="0.2"/>
-
-        <!-- Server Icon -->
-        <g transform="translate(20, 20)">
-            <g clip-path="url(#c_icon)">
-                <image href="{s['icon']}" width="80" height="80" preserveAspectRatio="xMidYMid slice"/>
-            </g>
-            <rect width="80" height="80" rx="16" fill="none" stroke="#fff" stroke-opacity="0.2"/>
+    <!-- BG -->
+    <image href="{bg['data']}" width="{W}" height="{H}" preserveAspectRatio="none"/>
+    
+    <!-- HEADER -->
+    <g transform="translate(40,40)">
+        <rect width="400" height="110" rx="20" fill="black" fill-opacity="0.6"/>
+        <rect width="400" height="110" rx="20" fill="none" stroke="white" stroke-opacity="0.1"/>
+        
+        <g transform="translate(15, 15)">
+            <g clip-path="url(#rn)"><image href="{s['icon']}" width="80" height="80"/></g>
         </g>
         
-        <!-- Texts -->
-        <text x="120" y="55" fill="#fff" font-family="{font}" font-weight="800" font-size="28" style="text-shadow: 0 2px 4px rgba(0,0,0,0.5)">{s['name']}</text>
+        <text x="110" y="45" fill="white" font-family="{font}" font-weight="800" font-size="26">{s['name']}</text>
         
-        <!-- Live Counters -->
-        <g transform="translate(120, 85)">
-             <circle cx="6" cy="6" r="6" fill="#3ba55c"/>
-             <text x="18" y="11" fill="#eee" font-family="{font}" font-weight="600" font-size="16">{s['onl']} Online</text>
-             
-             <circle cx="150" cy="6" r="6" fill="#b9bbbe"/>
-             <text x="162" y="11" fill="#eee" font-family="{font}" font-weight="600" font-size="16">{s['mem']} Members</text>
+        <g transform="translate(110, 75)">
+            <circle cx="6" cy="6" r="6" fill="#3ba55c"/>
+            <text x="18" y="11" fill="#ddd" font-family="{font}" font-weight="600" font-size="14">{s['onl']} Online</text>
+            <circle cx="120" cy="6" r="6" fill="#b9bbbe"/>
+            <text x="132" y="11" fill="#ddd" font-family="{font}" font-weight="600" font-size="14">{s['mem']} Members</text>
         </g>
     </g>
-
-    <!-- STAFF SECTION (Bottom Bar) -->
-    <g transform="translate(40, {H - 90})">
+    
+    <!-- STAFF -->
+    <g transform="translate(40, {H-80})">
     """
     
-    # Label
-    if staff_cards:
-        svg += f"""<text x="0" y="-15" fill="#fff" font-family="{font}" font-weight="800" font-size="12" opacity="0.8" letter-spacing="2">KEY ROLES</text>"""
-
-    offset_x = 0
+    off = 0
     for u in staff_cards:
         if not u['avatar']: continue
-        
-        # Ensure role isn't too long
-        d_role = u['role'][:20].upper()
-        d_name = u['name'][:16]
-        
         svg += f"""
-        <g transform="translate({offset_x}, 0)">
-            <!-- Pill Card -->
-            <rect width="210" height="60" rx="30" fill="#000" fill-opacity="0.75" />
-            <rect width="210" height="60" rx="30" fill="none" stroke="{u['color']}" stroke-opacity="0.4" stroke-width="1.5"/>
-            
-            <!-- Avatar Circle -->
-            <g transform="translate(10, 10)">
-                 <g clip-path="url(#c_ava)">
-                    <image href="{u['avatar']}" width="40" height="40"/>
-                 </g>
-                 <!-- Status Indicator Border -->
+        <g transform="translate({off}, 0)">
+            <rect width="200" height="50" rx="25" fill="black" fill-opacity="0.75"/>
+            <rect width="200" height="50" rx="25" fill="none" stroke="{u['color']}" stroke-opacity="0.5"/>
+            <g transform="translate(5, 5)">
+                 <g clip-path="url(#ci)"><image href="{u['avatar']}" width="40" height="40"/></g>
                  <circle cx="20" cy="20" r="21" fill="none" stroke="{u['color']}" stroke-width="2"/>
             </g>
-            
-            <!-- Name / Role -->
-            <text x="60" y="27" fill="#fff" font-family="{font}" font-weight="700" font-size="14">{d_name}</text>
-            <text x="60" y="45" fill="{u['color']}" font-family="{font}" font-weight="800" font-size="10" letter-spacing="1">{d_role}</text>
+            <text x="55" y="20" fill="white" font-family="{font}" font-weight="700" font-size="13">{u['name'][:14]}</text>
+            <text x="55" y="36" fill="{u['color']}" font-family="{font}" font-weight="800" font-size="9" letter-spacing="1">{u['role'][:18].upper()}</text>
         </g>
         """
-        offset_x += 225
-
+        off += 210
+        
     svg += "</g></svg>"
 
-    resp = make_response(svg)
-    resp.headers['Content-Type'] = 'image/svg+xml'
-    resp.headers['Cache-Control'] = f'max-age={CACHE_DURATION}'
-    return resp
+    r = make_response(svg)
+    r.headers['Content-Type'] = 'image/svg+xml'
+    r.headers['Cache-Control'] = 'max-age=120' # Tell GitHub to cache this for 2 mins
+    return r
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    # Local Dev
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
