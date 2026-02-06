@@ -1,221 +1,306 @@
 import os
 import requests
 import base64
-import html 
+import html
+import time
 from io import BytesIO
 from flask import Flask, Response, request, make_response
 from PIL import Image, ImageFilter, ImageEnhance
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 
-# --- ENV ---
-# Ensure you add DISCORD_TOKEN to Render Environment Variables
-BOT_TOKEN = os.environ.get("DISCORD_TOKEN") 
+# --- 1. CONFIGURATION ---
+BOT_TOKEN = os.environ.get("DISCORD_TOKEN")
+CACHE_DURATION = 120  # Seconds to cache data (Keep Discord happy)
 
-CACHE = {}
+# Internal RAM Cache
+CACHE = {} 
+IMG_CACHE = {}
 
-# --- HELPERS ---
+# --- 2. THE BOT NETWORK ENGINE ---
 
-def get_headers(use_token=False):
-    headers = {"User-Agent": "ServerStats/1.0"}
-    if use_token and BOT_TOKEN:
+# Setup a robust session with Retries to handle 429s automatically
+session = requests.Session()
+
+# Add logic to automatically wait and retry if Discord is busy
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,  # Wait 1s, then 2s, then 4s
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+def get_discord_headers():
+    """Forces all requests to appear as the Bot, not the shared server IP."""
+    headers = {
+        "User-Agent": "DiscordBot (https://github.com/your-repo, 1.0)",
+        "Content-Type": "application/json"
+    }
+    # This is the Key: Routes traffic via Bot Identity
+    if BOT_TOKEN:
         headers["Authorization"] = f"Bot {BOT_TOKEN}"
     return headers
 
-def safe_txt(text):
-    """Escapes characters like <, >, &, " to prevent XML errors."""
-    if not text: return ""
-    return html.escape(str(text))
+def safe(text):
+    """Prevents XML breakage."""
+    return html.escape(str(text)) if text else ""
 
-def fetch_and_process_image(url, blur=0, dim_opacity=0.0, target_width=800):
-    cache_key = f"img_{url}_{blur}_{dim_opacity}_{target_width}"
-    if cache_key in CACHE: return CACHE[cache_key]
+# --- 3. ADVANCED IMAGE PROCESSING ---
+
+def fetch_image_asset(url, width=100, height=None, blur=0, dim=0.0):
+    """
+    Downloads, resizes, optimizes, blurs, and caches images.
+    """
+    # 1. Check Cache
+    key = f"{url}-{width}-{blur}-{dim}"
+    if key in IMG_CACHE: return IMG_CACHE[key]
 
     try:
-        r = requests.get(url, timeout=4)
+        # Use our session with headers (avoids blocking on image domains)
+        r = session.get(url, timeout=5)
+        
         if r.status_code == 200:
             img = Image.open(BytesIO(r.content)).convert('RGB')
-            
-            w, h = img.size
-            ratio = h / w
-            new_h = int(target_width * ratio)
-            
-            img = img.resize((target_width, new_h), Image.Resampling.LANCZOS)
-            
-            if blur > 0:
-                img = img.filter(ImageFilter.GaussianBlur(blur))
-            
-            if dim_opacity > 0:
-                enhancer = ImageEnhance.Brightness(img)
-                img = enhancer.enhance(1.0 - dim_opacity)
 
+            # Smart Resize
+            if not height:
+                ratio = img.height / img.width
+                height = int(width * ratio)
+            
+            img = img.resize((width, height), Image.Resampling.LANCZOS)
+
+            # Apply Effects
+            if blur > 0: img = img.filter(ImageFilter.GaussianBlur(blur))
+            if dim > 0:
+                e = ImageEnhance.Brightness(img)
+                img = e.enhance(1.0 - dim)
+
+            # Export
             buff = BytesIO()
             img.save(buff, format="JPEG", quality=90)
             b64 = f"data:image/jpeg;base64,{base64.b64encode(buff.getvalue()).decode('utf-8')}"
             
-            res = {"b64": b64, "w": target_width, "h": new_h}
-            CACHE[cache_key] = res
-            return res
-    except:
-        pass
+            # Save to Cache
+            IMG_CACHE[key] = {"data": b64, "w": width, "h": height}
+            return IMG_CACHE[key]
+    except Exception as e:
+        print(f"Img Error: {e}")
+
+    # Fallback Placeholder
+    return {"data": "", "w": width, "h": height or 100}
+
+# --- 4. DATA LOGIC ---
+
+def fetch_user_data(uid, override_role=None, override_color=None):
+    """Combines Lanyard (Real Status) + Discord API (Profile)"""
     
-    return {"b64": "", "w": target_width, "h": 400}
+    # Defaults
+    user = {
+        "name": "User", 
+        "role": override_role or "Member", 
+        "color": override_color or "#747f8d", 
+        "avatar": "",
+        "found": False
+    }
 
-# --- FETCH DATA ---
-
-def fetch_lanyard(user_id):
+    # A. Try Lanyard (For Status Color)
     try:
-        r = requests.get(f"https://api.lanyard.rest/v1/users/{user_id}", timeout=2)
-        return r.json()['data'] if r.status_code == 200 and r.json()['success'] else None
-    except: return None
+        r = session.get(f"https://api.lanyard.rest/v1/users/{uid}", timeout=2)
+        if r.status_code == 200:
+            data = r.json()
+            if data['success']:
+                lanyard = data['data']
+                discord = lanyard['discord_user']
+                
+                user['found'] = True
+                user['name'] = discord['username']
+                
+                # Dynamic Status Color (unless overridden)
+                if not override_color:
+                    status = lanyard['discord_status']
+                    colors = {'online': '#3ba55c', 'idle': '#faa61a', 'dnd': '#ed4245', 'offline': '#747f8d'}
+                    user['color'] = colors.get(status, '#747f8d')
 
-def fetch_discord_user(user_id):
-    if not BOT_TOKEN: return None
-    try:
-        r = requests.get(f"https://discord.com/api/v10/users/{user_id}", headers=get_headers(True), timeout=3)
-        return r.json() if r.status_code == 200 else None
-    except: return None
+                # Avatar
+                if discord['avatar']:
+                     ext = "gif" if discord['avatar'].startswith("a_") else "png"
+                     user['avatar'] = f"https://cdn.discordapp.com/avatars/{uid}/{discord['avatar']}.{ext}?size=64"
+    except: pass
 
-# --- MAIN ROUTE ---
+    # B. Fallback to Bot API (If Lanyard fails)
+    if not user['found'] and BOT_TOKEN:
+        try:
+            r = session.get(f"https://discord.com/api/v10/users/{uid}", headers=get_headers(), timeout=3)
+            if r.status_code == 200:
+                d = r.json()
+                user['name'] = d['username']
+                if d.get('avatar'):
+                    user['avatar'] = f"https://cdn.discordapp.com/avatars/{uid}/{d['avatar']}.png?size=64"
+        except: pass
+
+    return user
+
+# --- 5. MAIN ROUTE ---
 
 @app.route('/stats')
 def render_stats():
+    # INPUTS
     invite_code = request.args.get('invite')
-    bg_url = request.args.get('bg', 'https://i.imgur.com/2aL8jE3.jpeg') 
-    staff_param = request.args.get('staff', '') 
-
+    bg_url = request.args.get('bg') or "https://i.imgur.com/2aL8jE3.jpeg" # Default Chillax
+    staff_string = request.args.get('staff', '') 
+    
     if not invite_code:
         return Response("Error: Missing ?invite=CODE", status=400)
 
-    # 1. Background
-    bg_data = fetch_and_process_image(bg_url, blur=0, dim_opacity=0.3, target_width=800)
-    W, H = bg_data['w'], bg_data['h']
-    
-    # 2. Server Data
-    s_data = {"name": "Server Error", "mem": "0", "onl": "0", "icon": ""}
+    # 1. PROCESS BG
+    bg_asset = fetch_image_asset(bg_url, width=900, blur=0, dim=0.4)
+    W, H = bg_asset['w'], bg_asset['h']
+
+    # 2. FETCH SERVER
+    s = {"name": "Server Loading", "onl": "0", "mem": "0", "icon": ""}
     
     try:
-        # Tries to get data; if RateLimited (429), it returns "Rate Limited" text
-        r = requests.get(f"https://discord.com/api/v10/invites/{invite_code}?with_counts=true", headers=get_headers(use_token=True), timeout=5)
+        # We explicitly use the BOT session here to route traffic
+        url = f"https://discord.com/api/v10/invites/{invite_code}?with_counts=true"
+        r = session.get(url, headers=get_discord_headers(), timeout=5)
         
         if r.status_code == 200:
             d = r.json()
-            g = d.get('guild', {})
-            s_data['name'] = safe_txt(g.get('name', 'Server'))
-            s_data['mem'] = f"{d.get('approximate_member_count', 0):,}"
-            s_data['onl'] = f"{d.get('approximate_presence_count', 0):,}"
+            g = d.get('guild')
+            
+            s['name'] = safe(g.get('name'))
+            s['mem'] = f"{d.get('approximate_member_count', 0):,}"
+            s['onl'] = f"{d.get('approximate_presence_count', 0):,}"
             
             if g.get('icon'):
                 icon_url = f"https://cdn.discordapp.com/icons/{g['id']}/{g['icon']}.png?size=128"
-                s_data['icon'] = fetch_and_process_image(icon_url, target_width=80)['b64']
+                # Process Icon
+                s['icon'] = fetch_image_asset(icon_url, width=100)['data']
+                
+        elif r.status_code == 429:
+            s['name'] = "Rate Limited (Wait)"
+            print("Server is 429ing even with Bot Token.")
         else:
-            s_data['name'] = f"Invalid ({r.status_code})"
+            s['name'] = f"Invalid Invite ({r.status_code})"
 
-    except:
-        s_data['name'] = "API Error"
+    except Exception as e:
+        print(f"Server Error: {e}")
+        s['name'] = "Connection Error"
 
-    # 3. Staff Logic
+    # 3. PROCESS STAFF ROLES
+    # Format: id:Role:Color, id:Role
     staff_cards = []
-    if staff_param:
-        for item in staff_param.split(','):
-            if not item.strip(): continue
-            parts = item.strip().split(':')
+    if staff_string:
+        entries = staff_string.split(',')
+        for entry in entries:
+            parts = entry.strip().split(':')
             uid = parts[0]
             role = parts[1] if len(parts) > 1 else "Staff"
+            color = parts[2] if len(parts) > 2 else None # Optional custom color override
             
-            u_obj = {"name": "Unknown", "role": safe_txt(role), "color": "#747f8d", "avatar": ""}
+            # Fetch
+            u_data = fetch_user_data(uid, override_role=role, override_color=color)
             
-            lany = fetch_lanyard(uid)
-            if lany:
-                duser = lany.get('discord_user')
-                if duser:
-                    u_obj['name'] = safe_txt(duser['username'])
-                    # Check Lanyard Avatar
-                    if duser['avatar']:
-                        url = f"https://cdn.discordapp.com/avatars/{duser['id']}/{duser['avatar']}.png?size=64"
-                        u_obj['avatar'] = fetch_and_process_image(url, target_width=64)['b64']
-                    
-                    status_map = {'online':'#3ba55c','idle':'#faa61a','dnd':'#ed4245','offline':'#747f8d'}
-                    u_obj['color'] = status_map.get(lany.get('discord_status'), '#747f8d')
-            else:
-                duser = fetch_discord_user(uid)
-                if duser:
-                    u_obj['name'] = safe_txt(duser['username'])
-                    if duser.get('avatar'):
-                         url = f"https://cdn.discordapp.com/avatars/{duser['id']}/{duser['avatar']}.png?size=64"
-                         u_obj['avatar'] = fetch_and_process_image(url, target_width=64)['b64']
+            # Optimize Avatar for SVG
+            if u_data['avatar']:
+                u_data['avatar'] = fetch_image_asset(u_data['avatar'], width=64)['data']
+            
+            staff_cards.append(u_data)
 
-            staff_cards.append(u_obj)
-
-    # 4. Construct SVG
-    # ERROR FIX: Switched from "Segoe UI" to 'Segoe UI' (Single quotes) to not break HTML attribute
+    # 4. DRAW SVG (Complex Glass UI)
     font = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
     
-    # Header logic
-    svg = f"""<svg width="{W}" height="{H}" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+    # Calculate Dynamic Height (Base + Staff Rows)
+    # But for a banner we usually keep fixed or aspect. Let's trust the BG.
+    
+    svg = f"""
+    <svg width="{W}" height="{H}" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
     <defs>
-        <clipPath id="rnd"><rect width="80" height="80" rx="18"/></clipPath>
-        <clipPath id="circ"><circle cx="24" cy="24" r="24"/></clipPath>
+        <clipPath id="c_icon"><rect width="80" height="80" rx="16"/></clipPath>
+        <clipPath id="c_ava"><circle cx="20" cy="20" r="20"/></clipPath>
+        <linearGradient id="grad_pill" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#fff" stop-opacity="0.15"/>
+            <stop offset="100%" stop-color="#fff" stop-opacity="0.05"/>
+        </linearGradient>
     </defs>
 
-    <!-- BG -->
-    <image href="{bg_data['b64']}" width="{W}" height="{H}" preserveAspectRatio="xMidYMid slice" />
-    <rect width="{W}" height="{H}" fill="black" fill-opacity="0.2"/>
-
-    <!-- SECTION 1: SERVER INFO -->
+    <!-- Background -->
+    <image href="{bg_asset['data']}" width="{W}" height="{H}" />
+    
+    <!-- MAIN SERVER CARD (Floating Top Left) -->
     <g transform="translate(40, 40)">
-        <rect x="-15" y="-15" width="420" height="110" rx="20" fill="black" fill-opacity="0.6"/>
-        <rect x="-15" y="-15" width="420" height="110" rx="20" fill="none" stroke="white" stroke-opacity="0.1"/>
+        <!-- Frosted Glass Backing -->
+        <rect width="450" height="120" rx="20" fill="#000" fill-opacity="0.65"/>
+        <rect width="450" height="120" rx="20" fill="url(#grad_pill)" stroke="#fff" stroke-opacity="0.2"/>
 
-        <g clip-path="url(#rnd)">
-            <image href="{s_data['icon']}" width="80" height="80"/>
+        <!-- Server Icon -->
+        <g transform="translate(20, 20)">
+            <g clip-path="url(#c_icon)">
+                <image href="{s['icon']}" width="80" height="80" preserveAspectRatio="xMidYMid slice"/>
+            </g>
+            <rect width="80" height="80" rx="16" fill="none" stroke="#fff" stroke-opacity="0.2"/>
         </g>
         
-        <text x="100" y="32" fill="white" font-family="{font}" font-weight="800" font-size="24">{s_data['name']}</text>
+        <!-- Texts -->
+        <text x="120" y="55" fill="#fff" font-family="{font}" font-weight="800" font-size="28" style="text-shadow: 0 2px 4px rgba(0,0,0,0.5)">{s['name']}</text>
         
-        <g transform="translate(100, 60)">
-             <circle cx="8" cy="8" r="5" fill="#3ba55c"/>
-             <text x="22" y="13" fill="#cfd0d1" font-family="{font}" font-weight="600" font-size="14">{s_data['onl']} Online</text>
+        <!-- Live Counters -->
+        <g transform="translate(120, 85)">
+             <circle cx="6" cy="6" r="6" fill="#3ba55c"/>
+             <text x="18" y="11" fill="#eee" font-family="{font}" font-weight="600" font-size="16">{s['onl']} Online</text>
              
-             <circle cx="140" cy="8" r="5" fill="#b9bbbe"/>
-             <text x="154" y="13" fill="#cfd0d1" font-family="{font}" font-weight="600" font-size="14">{s_data['mem']} Members</text>
+             <circle cx="150" cy="6" r="6" fill="#b9bbbe"/>
+             <text x="162" y="11" fill="#eee" font-family="{font}" font-weight="600" font-size="16">{s['mem']} Members</text>
         </g>
     </g>
 
-    <!-- SECTION 2: STAFF LIST -->
+    <!-- STAFF SECTION (Bottom Bar) -->
     <g transform="translate(40, {H - 90})">
     """
-
+    
+    # Label
     if staff_cards:
-        svg += f"""<text x="5" y="-15" fill="white" font-family="{font}" font-weight="700" font-size="10" opacity="0.7" letter-spacing="1">TEAM STATUS</text>"""
+        svg += f"""<text x="0" y="-15" fill="#fff" font-family="{font}" font-weight="800" font-size="12" opacity="0.8" letter-spacing="2">KEY ROLES</text>"""
 
-    x_offset = 0
-    for s in staff_cards:
-        if not s['avatar']: continue
+    offset_x = 0
+    for u in staff_cards:
+        if not u['avatar']: continue
+        
+        # Ensure role isn't too long
+        d_role = u['role'][:20].upper()
+        d_name = u['name'][:16]
         
         svg += f"""
-        <g transform="translate({x_offset}, 0)">
-            <rect width="200" height="54" rx="27" fill="black" fill-opacity="0.7"/>
-            <rect width="200" height="54" rx="27" fill="none" stroke="white" stroke-opacity="0.1"/>
+        <g transform="translate({offset_x}, 0)">
+            <!-- Pill Card -->
+            <rect width="210" height="60" rx="30" fill="#000" fill-opacity="0.75" />
+            <rect width="210" height="60" rx="30" fill="none" stroke="{u['color']}" stroke-opacity="0.4" stroke-width="1.5"/>
             
-            <g transform="translate(3, 3)">
-                <g clip-path="url(#circ)">
-                    <image href="{s['avatar']}" width="48" height="48"/>
-                </g>
-                <circle cx="38" cy="38" r="7" fill="{s['color']}" stroke="#202225" stroke-width="2"/>
+            <!-- Avatar Circle -->
+            <g transform="translate(10, 10)">
+                 <g clip-path="url(#c_ava)">
+                    <image href="{u['avatar']}" width="40" height="40"/>
+                 </g>
+                 <!-- Status Indicator Border -->
+                 <circle cx="20" cy="20" r="21" fill="none" stroke="{u['color']}" stroke-width="2"/>
             </g>
             
-            <text x="60" y="22" fill="white" font-family="{font}" font-weight="700" font-size="14">{s['name']}</text>
-            <text x="60" y="39" fill="{s['color']}" font-family="{font}" font-weight="700" font-size="10" text-transform="uppercase" letter-spacing="0.5">{s['role']}</text>
+            <!-- Name / Role -->
+            <text x="60" y="27" fill="#fff" font-family="{font}" font-weight="700" font-size="14">{d_name}</text>
+            <text x="60" y="45" fill="{u['color']}" font-family="{font}" font-weight="800" font-size="10" letter-spacing="1">{d_role}</text>
         </g>
         """
-        x_offset += 210
+        offset_x += 225
 
-    svg += """</g></svg>"""
-    
+    svg += "</g></svg>"
+
     resp = make_response(svg)
     resp.headers['Content-Type'] = 'image/svg+xml'
-    resp.headers['Cache-Control'] = 'no-cache, max-age=120'
+    resp.headers['Cache-Control'] = f'max-age={CACHE_DURATION}'
     return resp
 
 if __name__ == '__main__':
